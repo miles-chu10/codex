@@ -1,7 +1,11 @@
 use std::io::Write as _;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::ErrorResponse;
+use tokio_tungstenite::tungstenite::handshake::server::Request;
+use tokio_tungstenite::tungstenite::handshake::server::Response;
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tracing::warn;
 
 use crate::ExecServerRuntimePaths;
@@ -14,6 +18,7 @@ pub const DEFAULT_LISTEN_URL: &str = "ws://127.0.0.1:0";
 pub enum ExecServerListenUrlParseError {
     UnsupportedListenUrl(String),
     InvalidWebSocketListenUrl(String),
+    NonLoopbackWebSocketListenUrl(String),
 }
 
 impl std::fmt::Display for ExecServerListenUrlParseError {
@@ -27,6 +32,10 @@ impl std::fmt::Display for ExecServerListenUrlParseError {
                 f,
                 "invalid websocket --listen URL `{listen_url}`; expected `ws://IP:PORT`"
             ),
+            ExecServerListenUrlParseError::NonLoopbackWebSocketListenUrl(listen_url) => write!(
+                f,
+                "unsafe websocket --listen URL `{listen_url}`; exec-server only supports loopback addresses"
+            ),
         }
     }
 }
@@ -37,9 +46,17 @@ pub(crate) fn parse_listen_url(
     listen_url: &str,
 ) -> Result<SocketAddr, ExecServerListenUrlParseError> {
     if let Some(socket_addr) = listen_url.strip_prefix("ws://") {
-        return socket_addr.parse::<SocketAddr>().map_err(|_| {
+        let socket_addr = socket_addr.parse::<SocketAddr>().map_err(|_| {
             ExecServerListenUrlParseError::InvalidWebSocketListenUrl(listen_url.to_string())
-        });
+        })?;
+        if !socket_addr.ip().is_loopback() {
+            return Err(
+                ExecServerListenUrlParseError::NonLoopbackWebSocketListenUrl(
+                    listen_url.to_string(),
+                ),
+            );
+        }
+        return Ok(socket_addr);
     }
 
     Err(ExecServerListenUrlParseError::UnsupportedListenUrl(
@@ -70,7 +87,7 @@ async fn run_websocket_listener(
         let (stream, peer_addr) = listener.accept().await?;
         let processor = processor.clone();
         tokio::spawn(async move {
-            match accept_async(stream).await {
+            match accept_hdr_async(stream, reject_origin_header).await {
                 Ok(websocket) => {
                     processor
                         .run_connection(JsonRpcConnection::from_websocket(
@@ -87,6 +104,19 @@ async fn run_websocket_listener(
             }
         });
     }
+}
+
+fn reject_origin_header(request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+    if request.headers().contains_key("origin") {
+        warn!("rejecting exec-server websocket request with Origin header");
+        let mut response = ErrorResponse::new(Some(
+            "browser Origin websocket requests are not allowed".to_string(),
+        ));
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return Err(response);
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]
