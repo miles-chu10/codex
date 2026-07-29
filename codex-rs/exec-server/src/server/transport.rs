@@ -108,7 +108,6 @@ async fn run_websocket_listener(
 
 fn reject_origin_header(request: &Request, response: Response) -> Result<Response, ErrorResponse> {
     if request.headers().contains_key("origin") {
-        warn!("rejecting exec-server websocket request with Origin header");
         let mut response = ErrorResponse::new(Some(
             "browser Origin websocket requests are not allowed".to_string(),
         ));
